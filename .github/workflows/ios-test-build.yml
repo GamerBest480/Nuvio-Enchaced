@@ -22,10 +22,10 @@ concurrency:
 jobs:
   build:
     name: Build unsigned full ${{ inputs.configuration }} IPA
-    runs-on: xcode-27
+    runs-on: macos-15
     timeout-minutes: ${{ inputs.configuration == 'Release' && 180 || 30 }}
     env:
-      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       GRADLE_OPTS: -Dfile.encoding=UTF-8
       IOS_CONFIGURATION: ${{ inputs.configuration }}
       KOTLIN_DAEMON_JVMARGS: -Xmx1024M
@@ -35,23 +35,49 @@ jobs:
       CONTRIBUTIONS_URL: https://api.github.com/repos/luqmanfadlli/NuvioMobile-Enhanced/contributors?per_page=100
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v6
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract Nuvio source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          if [[ -z "$archive" ]]; then
+            echo "No source ZIP found in the repository root."
+            exit 1
+          fi
+          mkdir -p source
+          ditto -x -k "$archive" source
+          build_script="$(find "$PWD/source" -type f -path '*/scripts/build-ios-ipa.sh' -print -quit)"
+          if [[ -z "$build_script" ]]; then
+            echo "The ZIP does not contain scripts/build-ios-ipa.sh."
+            echo "Contents of extracted source:"
+            find source -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+          source_dir="$(dirname "$(dirname "$build_script")")"
+          echo "NUVIO_SOURCE_DIR=$source_dir" >> "$GITHUB_ENV"
+          echo "Found Nuvio project at: $source_dir"
+          test -f "$source_dir/gradlew" || {
+            echo "Gradle wrapper (gradlew) was not found in the project root."
+            exit 1
+          }
 
       - name: Set up Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Cache Kotlin Native
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: ~/.konan
-          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/gradle/libs.versions.toml') }}
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
 
@@ -62,6 +88,7 @@ jobs:
 
       - name: Configure runtime properties
         if: env.RELEASE_PROPERTIES_BASE64 != ''
+        working-directory: ${{ env.NUVIO_SOURCE_DIR }}
         run: |
           printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
           sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
@@ -84,9 +111,11 @@ jobs:
           cat "${gradle_user_home}/gradle.properties"
 
       - name: Prepare iOS dependencies
+        working-directory: ${{ env.NUVIO_SOURCE_DIR }}
         run: ./scripts/prepare-ios-dependencies.sh
 
       - name: Build unsigned full ${{ inputs.configuration }} IPA
+        working-directory: ${{ env.NUVIO_SOURCE_DIR }}
         run: |
           (
             while sleep 60; do
@@ -102,6 +131,7 @@ jobs:
           ./scripts/build-ios-ipa.sh
 
       - name: Summarize IPA
+        working-directory: ${{ env.NUVIO_SOURCE_DIR }}
         run: |
           configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:lower:]')"
           ipa_path="$(find build/ios-ipa -maxdepth 1 -type f -name "*-${configuration_slug}.ipa" -print -quit)"
@@ -109,7 +139,6 @@ jobs:
             echo "No IPA was produced." >&2
             exit 1
           fi
-
           {
             echo "## Test IPA"
             echo
@@ -122,7 +151,8 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload test IPA
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: nuvio-test-${{ inputs.configuration }}-ipa-${{ github.sha }}
-          path: build/ios-ipa/*.ipa
+          path: ${{ env.NUVIO_SOURCE_DIR }}/build/ios-ipa/*.ipa
+          if-no-files-found: error
